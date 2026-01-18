@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Output files
+output/*
+!output/.gitkeep
+*.csv
+*.xlsx
+*.json
+!examples/*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PDFs (user data)
+*.pdf
+pdfs/
+boms/
