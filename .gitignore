@@ -18,17 +18,19 @@ ENV/
 
 # Output files
 output/*
-!output/.gitkeep
+!output/README.md
+
+# Input PDFs (user data)
+boms/*
+!boms/README.md
+
+# Loose files
 *.csv
 *.xlsx
 *.json
+*.pdf
 !examples/*.csv
 
 # OS
 .DS_Store
 Thumbs.db
-
-# PDFs (user data)
-*.pdf
-pdfs/
-boms/
