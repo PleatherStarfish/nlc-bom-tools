@@ -15,42 +15,79 @@ import pandas as pd
 
 
 # =============================================================================
+# Configuration
+# =============================================================================
+
+# Number of part number columns to generate per supplier
+MAX_PN_COLUMNS = 3
+
+
+# =============================================================================
 # Part Number Extraction
 # =============================================================================
 
-def extract_tayda_pn(text: str) -> str:
-    """Extract Tayda part number from text."""
+def extract_tayda_pn(text: str) -> list[str]:
+    """Extract all Tayda part numbers from text.
+    
+    Tayda format: A-XXXX where X is digits, sometimes with suffix like A-1234-RED
+    Examples: A-1234, A-01234, A-5476-OG, A-3500
+    """
     if not text or pd.isna(text):
-        return ""
+        return []
     text = str(text)
-    # Patterns: "Tayda: A-1234", "Tayda A-1234", "A-1234-RED", "A-01234"
-    m = re.search(r'[Tt]ayda[:\s]+([A-Za-z]+[-\dA-Za-z]+)', text)
-    if m:
-        return m.group(1).upper()
-    return ""
+    
+    found = set()
+    
+    # Pattern 1: Explicit "Tayda: A-1234" or "Tayda A-1234"
+    for m in re.finditer(r'[Tt]ayda[:\s]+([A-Z]-\d+(?:-[A-Z0-9]+)?)', text, re.I):
+        found.add(m.group(1).upper())
+    
+    # Pattern 2: Standalone A-XXXX pattern (Tayda's standard format)
+    # Must start with A- followed by 3-5 digits, optionally followed by -suffix
+    for m in re.finditer(r'\b(A-\d{3,5}(?:-[A-Z0-9]+)?)\b', text, re.I):
+        found.add(m.group(1).upper())
+    
+    return sorted(found)
 
 
-def extract_mouser_pn(text: str) -> str:
-    """Extract Mouser part number from text."""
+def extract_mouser_pn(text: str) -> list[str]:
+    """Extract all Mouser part numbers from text.
+    
+    Mouser format: NNN-XXXXX where NNN is 3-4 digit manufacturer code
+    Examples: 595-TL072CP, 512-LM13700N/NOPB, 78-1N4148, 652-BC547BTA
+    """
     if not text or pd.isna(text):
-        return ""
+        return []
     text = str(text)
-    # Patterns: "Mouser: 595-TL072CP", "Mouser Part No 512-LM13700N/NOPB"
-    m = re.search(r'[Mm]ouser[:\s]+(?:Part\s*No\.?\s*)?([0-9]{3,4}-[A-Za-z0-9\-/]+)', text)
-    if m:
-        return m.group(1)
-    return ""
+    
+    found = set()
+    
+    # Pattern 1: Explicit "Mouser: 595-TL072" or "Mouser Part No 512-LM13700"
+    for m in re.finditer(r'[Mm]ouser[:\s]+(?:Part\s*No\.?\s*)?(\d{2,4}-[A-Za-z0-9\-/]+)', text):
+        found.add(m.group(1))
+    
+    # Pattern 2: Standalone Mouser PN format (3-4 digit prefix, dash, alphanumeric)
+    # Be careful not to match other things like dates or random numbers
+    for m in re.finditer(r'\b(\d{2,4}-[A-Z][A-Z0-9\-/]{3,})\b', text, re.I):
+        pn = m.group(1)
+        # Validate it looks like a real Mouser PN (not a date, not too short)
+        if len(pn) >= 8 and not re.match(r'^\d+-\d+$', pn):
+            found.add(pn)
+    
+    return sorted(found)
 
 
-def extract_digikey_pn(text: str) -> str:
-    """Extract DigiKey part number from text."""
+def extract_digikey_pn(text: str) -> list[str]:
+    """Extract all DigiKey part numbers from text."""
     if not text or pd.isna(text):
-        return ""
+        return []
     text = str(text)
-    m = re.search(r'[Dd]igi-?[Kk]ey[:\s]+([A-Za-z0-9-]+)', text)
-    if m:
-        return m.group(1)
-    return ""
+    
+    found = set()
+    for m in re.finditer(r'[Dd]igi-?[Kk]ey[:\s]+([A-Za-z0-9-]+)', text):
+        found.add(m.group(1))
+    
+    return sorted(found)
 
 
 def extract_package(text: str) -> str:
@@ -133,7 +170,7 @@ def is_valid_component(val: str) -> bool:
         r'^thru-?hole\s+resistors?$',  # "thru-hole resistors"
         r'^\d+\s+(and|or)\s+\d+\s*pin',  # "8 and/or 14 pin..."
         r'^\d+[kKmM]?\s+INSTALL',  # "33k INSTALL 10K"
-        r'^\d+[kKmM]?\d*\s*[–\-]\s*\d+',  # "4M7 – 10M" (range, not value) - both unicode and ascii dash
+        r'^\d+[kKmM]?\d*\s*[–\-]\s*\d+',  # "4M7 – 10M" (range, not value)
         r'^\d+\s+or\s+\d+\s+resistor',  # "1206 or 0805 resistors"
     ]
     
@@ -167,8 +204,6 @@ def normalize_value(val: str) -> tuple[str, str]:
     val = re.sub(r'\s+', ' ', val).strip()
     
     # --- RESISTORS ---
-    # Patterns: 100k, 100K, 4k7, 4K7, 100R, 100r, 100ohm, 100Ω, 10R resistor
-    
     # 4k7, 4K7, 1M2 style (European notation)
     m = re.match(r'^(\d+)\s*([kKmM])\s*(\d+)\s*(?:\(.*\))?\s*$', val)
     if m:
@@ -180,7 +215,6 @@ def normalize_value(val: str) -> tuple[str, str]:
     if m:
         mult = m.group(2).upper()
         num = m.group(1)
-        # Normalize 100.0 to 100
         if '.' in num and num.endswith('0'):
             num = num.rstrip('0').rstrip('.')
         return f"{num}{mult}", "resistor"
@@ -200,8 +234,6 @@ def normalize_value(val: str) -> tuple[str, str]:
         return "RL (LED resistor)", "resistor"
     
     # --- CAPACITORS ---
-    # Patterns: 100pF, 100p, 100nF, 100n, 1uF, 1u, 1μF, 10uF, also with SMD codes
-    
     # Value with SMD code: 100nF (104), 22nF/223
     m = re.match(r'^(\d+(?:\.\d+)?)\s*([pPnNuUμµ])[fF]?\s*[/\(]?\s*\d*\s*\)?\s*$', val)
     if m:
@@ -263,11 +295,11 @@ def normalize_value(val: str) -> tuple[str, str]:
     
     # --- TRANSISTORS ---
     transistor_patterns = [
-        (r'^BC[58][0-9]{2}.*', lambda m: m.group(0)[:5].upper()),  # BC547, BC857
+        (r'^BC[58][0-9]{2}.*', lambda m: m.group(0)[:5].upper()),
         (r'^2N\d{4}.*', lambda m: m.group(0)[:6].upper()),
         (r'^MMBF.*', lambda m: m.group(0).split()[0].upper()),
         (r'^BCM847.*', "BCM847DS"),
-        (r'^J\d{3}.*', lambda m: m.group(0).split()[0].upper()),  # J112, J309
+        (r'^J\d{3}.*', lambda m: m.group(0).split()[0].upper()),
     ]
     for pattern, repl in transistor_patterns:
         m = re.match(pattern, val, re.I)
@@ -354,9 +386,9 @@ def normalize_value(val: str) -> tuple[str, str]:
     if "78l05" in val.lower() or "7805" in val.lower():
         return "78L05", "regulator"
     
-    # --- Additional patterns to catch common variations ---
+    # --- Additional patterns ---
     
-    # Capacitors with "or" and SMD codes: "47n or 473", "100nF or 104"
+    # Capacitors with "or" and SMD codes
     m = re.match(r'^(\d+(?:\.\d+)?)\s*([pPnNuUμµ])[fF]?\s*(?:or|\/)?\s*\d*\s*$', val)
     if m:
         unit = m.group(2).lower()
@@ -364,23 +396,23 @@ def normalize_value(val: str) -> tuple[str, str]:
             unit = 'u'
         return f"{m.group(1)}{unit}F", "capacitor"
     
-    # Resistors with asterisks or question marks: "2M2*", "12k ?"
+    # Resistors with asterisks or question marks
     m = re.match(r'^(\d+)([kKmM])(\d*)\s*[\*\?]?\s*$', val)
     if m:
         mult = m.group(2).upper()
         suffix = m.group(3) if m.group(3) else ""
         return f"{m.group(1)}{mult}{suffix}", "resistor"
     
-    # Plain resistor value with asterisk: "470R*"
+    # Plain resistor value with asterisk
     m = re.match(r'^(\d+)\s*[rRΩ]\s*[\*\?]+\s*$', val)
     if m:
         return f"{m.group(1)}R", "resistor"
     
-    # LED resistors: Rd, RLv, RL variants
+    # LED resistors
     if re.match(r'^R[Ldv]+$', val, re.I):
         return "RL (LED resistor)", "resistor"
     
-    # LDR (light dependent resistor)
+    # LDR
     if val.upper() == "LDR":
         return "LDR", "sensor"
     
@@ -406,7 +438,7 @@ def normalize_value(val: str) -> tuple[str, str]:
         m = re.search(r'(DG[45]\d{2})', val, re.I)
         return m.group(1).upper(), "ic"
     
-    # More ICs: LM3900, 4013, 555/7555, SSI chips, LTC chips
+    # More ICs
     ic_generic_patterns = [
         (r'^LM\d{3,4}', lambda m: m.group(0).upper()),
         (r'^4013\b', "CD4013"),
@@ -428,7 +460,7 @@ def normalize_value(val: str) -> tuple[str, str]:
     if "79l05" in val.lower():
         return "79L05", "regulator"
     
-    # Capacitor with description: "10uF (25v...)", "100pF (101...)", "6n8 (6.8nF)"
+    # Capacitor with description
     m = re.match(r'^(\d+(?:\.\d+)?)\s*([pPnNuUμµ])[fF]?\s*\(', val)
     if m:
         unit = m.group(2).lower()
@@ -436,7 +468,7 @@ def normalize_value(val: str) -> tuple[str, str]:
             unit = 'u'
         return f"{m.group(1)}{unit}F", "capacitor"
     
-    # Capacitor with European notation and parenthetical: "6n8 (6.8nF)", "1n2 (1.2nF)"
+    # Capacitor with European notation
     m = re.match(r'^(\d+)([nNpPuU])(\d+)\s*\(', val)
     if m:
         unit = m.group(2).lower()
@@ -455,7 +487,7 @@ def normalize_value(val: str) -> tuple[str, str]:
     if m:
         return f"{m.group(1)}uF", "capacitor"
     
-    # "Cx 100n" style designator + value
+    # "Cx 100n" style
     m = re.match(r'^C\d+\s+(\d+(?:\.\d+)?)\s*([pPnNuUμµ])', val, re.I)
     if m:
         unit = m.group(2).lower()
@@ -510,16 +542,13 @@ def clean_quantity(qty) -> int:
     
     qty = str(qty).strip()
     
-    # Remove .0 from floats
     if qty.endswith('.0'):
         qty = qty[:-2]
     
-    # Handle "2x 3 pins" style
     m = re.match(r'^(\d+)\s*x\s*(\d+)', qty, re.I)
     if m:
         return int(m.group(1)) * int(m.group(2))
     
-    # Extract first number
     m = re.match(r'^(\d+)', qty)
     if m:
         return int(m.group(1))
@@ -537,29 +566,24 @@ def process_bom(input_path: Path) -> pd.DataFrame:
     df = pd.read_csv(input_path)
     print(f"Loaded {len(df)} rows from {input_path}")
     
-    # Consolidate value columns (different extractions use different column names)
     value_cols = ['Component', 'VALUE', 'component', 'Value']
     qty_cols = ['quantity', 'QUANTITY', 'Quantity']
     detail_cols = ['notes', 'DETAILS', 'Notes', 'NOTES', 'Details']
     
     rows = []
     for _, row in df.iterrows():
-        # Get module name
         module = clean_module_name(str(row.get('_module', '')))
         
-        # Find the value (try each possible column)
         value = ""
         for col in value_cols:
             if col in row and pd.notna(row[col]) and str(row[col]).strip():
                 value = str(row[col]).strip()
                 break
         
-        # Handle variant tables (torpor/apathy/inertia columns)
         variant_cols = ['torpor', 'apathy', 'inertia']
         has_variants = any(col in row and pd.notna(row.get(col)) for col in variant_cols)
         
         if has_variants and not value:
-            # This is a variant-style table - extract each variant
             designator = str(row.get('Component', row.get('component', ''))).strip()
             for variant in variant_cols:
                 if variant in row and pd.notna(row[variant]):
@@ -573,37 +597,31 @@ def process_bom(input_path: Path) -> pd.DataFrame:
                                 'Quantity': 1,
                                 'Type': comp_type,
                                 'Package': '',
-                                'Tayda': '',
-                                'Mouser': '',
+                                'Tayda_PNs': [],
+                                'Mouser_PNs': [],
                                 'Original': var_val,
                                 'Details': f"{designator} ({variant})",
                             })
             continue
         
-        # Get quantity
         qty = 1
         for col in qty_cols:
             if col in row and pd.notna(row[col]):
                 qty = clean_quantity(row[col])
                 break
         
-        # Get details
         details = ""
         for col in detail_cols:
             if col in row and pd.notna(row[col]) and str(row[col]).strip():
                 details = str(row[col]).strip()
                 break
         
-        # Also check original value column for part numbers (sometimes embedded there)
-        # Search ALL columns for part numbers, not just value + details
         all_text = " ".join(str(x) for x in row.values if pd.notna(x))
         
-        # Extract part numbers
-        tayda = extract_tayda_pn(all_text)
-        mouser = extract_mouser_pn(all_text)
+        tayda_pns = extract_tayda_pn(all_text)
+        mouser_pns = extract_mouser_pn(all_text)
         package = extract_package(all_text)
         
-        # Normalize value
         if value:
             norm_val, comp_type = normalize_value(value)
             if norm_val and comp_type != "skip":
@@ -613,8 +631,8 @@ def process_bom(input_path: Path) -> pd.DataFrame:
                     'Quantity': qty,
                     'Type': comp_type,
                     'Package': package,
-                    'Tayda': tayda,
-                    'Mouser': mouser,
+                    'Tayda_PNs': tayda_pns,
+                    'Mouser_PNs': mouser_pns,
                     'Original': value,
                     'Details': details,
                 })
@@ -634,15 +652,12 @@ def generate_stats(df: pd.DataFrame) -> dict:
         'unique_values': df['Value'].nunique(),
     }
     
-    # Count by type
     type_counts = df.groupby('Type')['Quantity'].sum().sort_values(ascending=False)
     stats['by_type'] = type_counts.to_dict()
     
-    # Most used overall
     value_counts = df.groupby('Value')['Quantity'].sum().sort_values(ascending=False)
     stats['most_used'] = value_counts.head(30).to_dict()
     
-    # Most used by type
     stats['most_used_by_type'] = {}
     for comp_type in ['resistor', 'capacitor', 'ic', 'connector', 'transistor', 'diode', 'pot']:
         type_df = df[df['Type'] == comp_type]
@@ -650,7 +665,6 @@ def generate_stats(df: pd.DataFrame) -> dict:
             counts = type_df.groupby('Value')['Quantity'].sum().sort_values(ascending=False)
             stats['most_used_by_type'][comp_type] = counts.head(10).to_dict()
     
-    # Module complexity (components per module)
     module_counts = df.groupby('Module')['Quantity'].sum().sort_values(ascending=False)
     stats['module_complexity'] = module_counts.to_dict()
     
@@ -695,9 +709,8 @@ def print_stats(stats: dict):
 
 
 def generate_shopping_list(df: pd.DataFrame, by_type: bool = True) -> pd.DataFrame:
-    """Generate consolidated shopping list with part numbers."""
+    """Generate consolidated shopping list with part numbers in separate columns."""
     
-    # Aggregate by normalized component value
     agg_data = defaultdict(lambda: {
         'total_qty': 0,
         'modules': set(),
@@ -718,47 +731,60 @@ def generate_shopping_list(df: pd.DataFrame, by_type: bool = True) -> pd.DataFra
         
         if row.get('Package'):
             agg_data[key]['packages'].add(row['Package'])
-        if row.get('Tayda'):
-            agg_data[key]['tayda_pns'].add(row['Tayda'])
-        if row.get('Mouser'):
-            agg_data[key]['mouser_pns'].add(row['Mouser'])
+        
+        tayda_list = row.get('Tayda_PNs', [])
+        mouser_list = row.get('Mouser_PNs', [])
+        
+        if isinstance(tayda_list, str) and tayda_list:
+            agg_data[key]['tayda_pns'].add(tayda_list)
+        elif isinstance(tayda_list, list):
+            agg_data[key]['tayda_pns'].update(tayda_list)
+            
+        if isinstance(mouser_list, str) and mouser_list:
+            agg_data[key]['mouser_pns'].add(mouser_list)
+        elif isinstance(mouser_list, list):
+            agg_data[key]['mouser_pns'].update(mouser_list)
     
-    # Convert to list of dicts
     rows = []
     for component, data in agg_data.items():
-        # Skip empty components
         if not component or not component.strip():
             continue
             
-        # Get best part number (prefer Tayda, then Mouser)
         tayda_list = sorted(data['tayda_pns']) if data['tayda_pns'] else []
         mouser_list = sorted(data['mouser_pns']) if data['mouser_pns'] else []
         
-        # Primary part number - first Tayda if available, else first Mouser
-        primary_pn = ""
-        if tayda_list:
-            primary_pn = tayda_list[0]
-        elif mouser_list:
-            primary_pn = mouser_list[0]
-        
-        rows.append({
+        row_data = {
             'Component': component,
             'Type': data['type'],
             'Qty': data['total_qty'],
             'Package': '; '.join(sorted(data['packages'])) if data['packages'] else '',
-            'Part_Number': primary_pn,
-            'Tayda_PN': '; '.join(tayda_list) if tayda_list else '',
-            'Mouser_PN': '; '.join(mouser_list) if mouser_list else '',
             'Modules': len(data['modules']),
-        })
+        }
+        
+        for i in range(MAX_PN_COLUMNS):
+            col_name = f'Tayda_PN_{i+1}'
+            row_data[col_name] = tayda_list[i] if i < len(tayda_list) else ''
+        
+        for i in range(MAX_PN_COLUMNS):
+            col_name = f'Mouser_PN_{i+1}'
+            row_data[col_name] = mouser_list[i] if i < len(mouser_list) else ''
+        
+        rows.append(row_data)
     
     shopping_df = pd.DataFrame(rows)
     
-    # Sort by type, then by quantity descending
     type_order = ['resistor', 'capacitor', 'ic', 'transistor', 'diode', 'connector', 'pot', 'led', 'sensor', 'vactrol', 'regulator', 'switch', 'other']
     shopping_df['_type_order'] = shopping_df['Type'].apply(lambda x: type_order.index(x) if x in type_order else 99)
     shopping_df = shopping_df.sort_values(['_type_order', 'Qty'], ascending=[True, False])
     shopping_df = shopping_df.drop(columns=['_type_order'])
+    
+    base_cols = ['Component', 'Type', 'Qty', 'Package']
+    tayda_cols = [f'Tayda_PN_{i+1}' for i in range(MAX_PN_COLUMNS)]
+    mouser_cols = [f'Mouser_PN_{i+1}' for i in range(MAX_PN_COLUMNS)]
+    final_cols = base_cols + tayda_cols + mouser_cols + ['Modules']
+    
+    final_cols = [c for c in final_cols if c in shopping_df.columns]
+    shopping_df = shopping_df[final_cols]
     
     return shopping_df
 
@@ -767,20 +793,11 @@ def generate_type_sheets(df: pd.DataFrame) -> dict:
     """Generate separate DataFrames for each component type."""
     sheets = {}
     
-    # Ensure required columns exist
-    for col in ['Tayda_PN', 'Mouser_PN', 'Part_Number']:
-        if col not in df.columns:
-            df[col] = ''
-    
     for comp_type in df['Type'].unique():
         type_df = df[df['Type'] == comp_type].copy()
-        
-        # Sort by quantity
         type_df = type_df.sort_values('Qty', ascending=False)
-        
-        # Clean up for this type
-        type_df = type_df[['Component', 'Qty', 'Package', 'Part_Number', 'Tayda_PN', 'Mouser_PN', 'Modules']]
-        
+        cols_to_keep = [c for c in type_df.columns if c != 'Type']
+        type_df = type_df[cols_to_keep]
         sheets[comp_type] = type_df
     
     return sheets
@@ -790,14 +807,11 @@ def save_shopping_excel(shopping_df: pd.DataFrame, output_path: Path):
     """Save shopping list as Excel with separate sheets per type."""
     
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        # Summary sheet - all components
         shopping_df.to_excel(writer, sheet_name='All Components', index=False)
         
-        # Separate sheets by type
         type_sheets = generate_type_sheets(shopping_df)
         
         for comp_type, type_df in type_sheets.items():
-            # Clean sheet name (Excel limits to 31 chars, no special chars)
             sheet_name = comp_type.capitalize()[:31]
             type_df.to_excel(writer, sheet_name=sheet_name, index=False)
     
@@ -808,6 +822,46 @@ def save_shopping_excel(shopping_df: pd.DataFrame, output_path: Path):
 # Main
 # =============================================================================
 
+def ensure_output_dir(path: Path) -> Path:
+    """Ensure the output directory exists and return the full path."""
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+    
+    if path.parent == Path(".") or path.parent == Path(""):
+        return output_dir / path
+    
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def parse_module_list(modules_str: str, available_modules: list[str]) -> list[str]:
+    """Parse comma-separated module list and match against available modules.
+    
+    Supports case-insensitive partial matching.
+    """
+    if not modules_str:
+        return []
+    
+    requested = [m.strip().lower() for m in modules_str.split(',')]
+    matched = []
+    
+    for req in requested:
+        # Try exact match first (case-insensitive)
+        exact = [m for m in available_modules if m.lower() == req]
+        if exact:
+            matched.extend(exact)
+            continue
+        
+        # Try partial match (module name contains the search term)
+        partial = [m for m in available_modules if req in m.lower()]
+        if partial:
+            matched.extend(partial)
+        else:
+            print(f"Warning: No module matching '{req}' found")
+    
+    return list(set(matched))  # Deduplicate
+
+
 def main():
     parser = argparse.ArgumentParser(description="Process NLC BOM data")
     parser.add_argument("input", type=Path, help="Input CSV file")
@@ -815,42 +869,79 @@ def main():
     parser.add_argument("--stats", action="store_true", help="Show statistics")
     parser.add_argument("--shopping", type=Path, help="Output shopping list (CSV or XLSX)")
     parser.add_argument("--type", type=str, help="Filter to specific type (resistor, capacitor, ic, etc.)")
+    parser.add_argument("--modules", type=str, help="Comma-separated list of module names to include (supports partial matching)")
+    parser.add_argument("--list-modules", action="store_true", help="List all available module names and exit")
+    parser.add_argument("--max-pn", type=int, default=3, help="Max part number columns per supplier (default: 3)")
+    parser.add_argument("--no-output-dir", action="store_true", help="Save files in current directory instead of output/")
     
     args = parser.parse_args()
     
-    # Process
+    global MAX_PN_COLUMNS
+    MAX_PN_COLUMNS = args.max_pn
+    
     df = process_bom(args.input)
     
-    # Output cleaned data (no type filter - export all)
-    if args.output:
-        output_df = df[df['Type'] == args.type.lower()].copy() if args.type else df
-        output_df.to_csv(args.output, index=False)
-        print(f"\nSaved cleaned data to {args.output}")
+    # List modules and exit if requested
+    if args.list_modules:
+        modules = sorted(df['Module'].unique())
+        print(f"\nAvailable modules ({len(modules)}):")
+        for m in modules:
+            count = df[df['Module'] == m]['Quantity'].sum()
+            print(f"  {m} ({count} components)")
+        return
     
-    # Statistics (no type filter - show all)
+    # Filter by modules if specified
+    if args.modules:
+        available = df['Module'].unique().tolist()
+        selected_modules = parse_module_list(args.modules, available)
+        if selected_modules:
+            print(f"\nFiltering to {len(selected_modules)} module(s): {', '.join(selected_modules)}")
+            df = df[df['Module'].isin(selected_modules)].copy()
+            print(f"  {len(df)} rows, {df['Quantity'].sum()} components")
+        else:
+            print("Error: No matching modules found")
+            return
+    
+    # Output cleaned data
+    if args.output:
+        output_path = args.output if args.no_output_dir else ensure_output_dir(args.output)
+        output_df = df[df['Type'] == args.type.lower()].copy() if args.type else df
+        for col in ['Tayda_PNs', 'Mouser_PNs']:
+            if col in output_df.columns:
+                output_df[col] = output_df[col].apply(lambda x: '; '.join(x) if isinstance(x, list) else x)
+        output_df.to_csv(output_path, index=False)
+        print(f"\nSaved cleaned data to {output_path}")
+    
+    # Statistics
     if args.stats or not (args.output or args.shopping):
         stats = generate_stats(df)
         print_stats(stats)
     
-    # Shopping list (apply type filter here only)
+    # Shopping list
     if args.shopping:
+        shopping_path = args.shopping if args.no_output_dir else ensure_output_dir(args.shopping)
         shopping_input = df[df['Type'] == args.type.lower()].copy() if args.type else df
         if args.type:
             print(f"Filtered to {len(shopping_input)} rows of type '{args.type}'")
         shopping = generate_shopping_list(shopping_input)
         
-        if args.shopping.suffix.lower() == '.xlsx':
-            save_shopping_excel(shopping, args.shopping)
+        if shopping_path.suffix.lower() == '.xlsx':
+            save_shopping_excel(shopping, shopping_path)
         else:
-            shopping.to_csv(args.shopping, index=False)
-            print(f"\nSaved shopping list to {args.shopping}")
+            shopping.to_csv(shopping_path, index=False)
+            print(f"\nSaved shopping list to {shopping_path}")
         
-        # Also print summary
         print(f"\n--- Shopping List Summary ---")
         print(f"Total unique components: {len(shopping)}")
         print(f"Total quantity: {shopping['Qty'].sum():,}")
-        print(f"Components with Tayda PN: {(shopping['Tayda_PN'] != '').sum()}")
-        print(f"Components with Mouser PN: {(shopping['Mouser_PN'] != '').sum()}")
+        
+        tayda_cols = [c for c in shopping.columns if c.startswith('Tayda_PN_')]
+        has_tayda = shopping[tayda_cols].apply(lambda row: any(row != ''), axis=1).sum()
+        print(f"Components with Tayda PN: {has_tayda}")
+        
+        mouser_cols = [c for c in shopping.columns if c.startswith('Mouser_PN_')]
+        has_mouser = shopping[mouser_cols].apply(lambda row: any(row != ''), axis=1).sum()
+        print(f"Components with Mouser PN: {has_mouser}")
 
 
 if __name__ == "__main__":
