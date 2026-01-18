@@ -8,18 +8,33 @@ Usage:
     python nlc_bom_extractor.py /path/to/bom/directory
     python nlc_bom_extractor.py /path/to/bom/directory --output json
     python nlc_bom_extractor.py /path/to/bom/directory --output excel --combine
+    python nlc_bom_extractor.py /path/to/bom/directory --filename-priority  # recommended
 """
 
 import argparse
 import json
 import os
+import re
 import sys
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+import hashlib
 
 import pandas as pd
 import tabula
+
+# Import the module name resolver
+from module_name_resolver import ModuleNameResolver
+
+
+def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def extract_tables_from_pdf(pdf_path: Path, pages: str = "all") -> list[pd.DataFrame]:
@@ -93,11 +108,8 @@ def clean_bom_dataframe(df: pd.DataFrame, min_cols: int = 2, min_rows: int = 3) 
         row_str = " ".join(str(v).lower() for v in row.values if pd.notna(v))
         if any(kw in row_str for kw in header_keywords):
             # Validate this looks like a real header row
-            # Reject if any cell is too long (likely data, not header)
             max_cell_len = max(len(str(v)) for v in row.values if pd.notna(v))
-            # Reject if cells contain newlines (multi-line content = data)
             has_newlines = any("\r" in str(v) or "\n" in str(v) for v in row.values if pd.notna(v))
-            # Reject if cells contain decimal numbers (likely quantities)
             has_decimals = any("." in str(v) and str(v).replace(".", "").isdigit() 
                              for v in row.values if pd.notna(v))
             
@@ -108,7 +120,6 @@ def clean_bom_dataframe(df: pd.DataFrame, min_cols: int = 2, min_rows: int = 3) 
     # If we found a header row, use it
     if header_row_idx is not None:
         new_headers = df.loc[header_row_idx].fillna("").astype(str).tolist()
-        # Make headers unique
         seen = {}
         unique_headers = []
         for h in new_headers:
@@ -123,13 +134,15 @@ def clean_bom_dataframe(df: pd.DataFrame, min_cols: int = 2, min_rows: int = 3) 
         df.columns = unique_headers
         df = df.loc[header_row_idx + 1:].reset_index(drop=True)
     else:
-        # No BOM header found - try to infer if it's a continuation table
-        # Check if columns look like VALUE/QTY/DETAILS pattern
+        # No BOM header found - try to infer structure
         if len(df.columns) >= 2:
-            # Look at the data to guess the structure
-            first_col_samples = df.iloc[:, 0].astype(str).tolist()[:5]
+            first_col_samples = df.iloc[:, 0].astype(str).tolist()[:10]
+            second_col_samples = df.iloc[:, 1].astype(str).tolist()[:10] if len(df.columns) > 1 else []
             
-            # If first column has component-like values, treat as BOM continuation
+            designator_pattern = re.compile(r'^[A-Z]+\d+[A-Z]?$', re.I)
+            designator_count = sum(1 for val in first_col_samples if designator_pattern.match(val.strip()))
+            looks_like_placement_list = designator_count > len(first_col_samples) * 0.5
+            
             component_patterns = ["pF", "nF", "uF", "µF", "ohm", "Ω", "k", "M", 
                                  "pot", "socket", "jack", "connector", "LED", 
                                  "TL0", "LM", "BC", "diode", "cap", "pin"]
@@ -139,8 +152,14 @@ def clean_bom_dataframe(df: pd.DataFrame, min_cols: int = 2, min_rows: int = 3) 
                 for val in first_col_samples
             )
             
-            if looks_like_bom:
-                # Assign generic column names based on count
+            if looks_like_placement_list:
+                if len(df.columns) == 2:
+                    df.columns = ["DESIGNATOR", "VALUE"]
+                elif len(df.columns) == 3:
+                    df.columns = ["DESIGNATOR", "VALUE", "NOTES"]
+                else:
+                    df.columns = ["DESIGNATOR", "VALUE", "NOTES"] + [f"col_{i}" for i in range(3, len(df.columns))]
+            elif looks_like_bom:
                 if len(df.columns) == 2:
                     df.columns = ["VALUE", "DETAILS"]
                 elif len(df.columns) == 3:
@@ -148,7 +167,6 @@ def clean_bom_dataframe(df: pd.DataFrame, min_cols: int = 2, min_rows: int = 3) 
                 else:
                     df.columns = ["VALUE", "QUANTITY", "DETAILS"] + [f"col_{i}" for i in range(3, len(df.columns))]
             else:
-                # Not a BOM table
                 return pd.DataFrame()
     
     # Remove empty-named columns
@@ -174,10 +192,7 @@ def clean_cell_value(value: str) -> str:
     if pd.isna(value) or value == "nan":
         return ""
     
-    # Replace various newline characters with space
     value = value.replace("\r", " ").replace("\n", " ")
-    
-    # Collapse multiple spaces
     while "  " in value:
         value = value.replace("  ", " ")
     
@@ -188,14 +203,12 @@ def extract_part_numbers(details: str) -> dict:
     """Extract supplier part numbers from the details field."""
     parts = {}
     
-    # Common patterns in NLC BOMs
     patterns = [
         (r"[Mm]ouser\s*(?:[Pp]art\s*)?(?:[Nn]o)?:?\s*([A-Z0-9\-]+)", "mouser"),
         (r"[Tt]ayda:?\s*([A-Z0-9\-]+)", "tayda"),
         (r"[Dd]igi-?[Kk]ey:?\s*([A-Z0-9\-]+)", "digikey"),
     ]
     
-    import re
     for pattern, supplier in patterns:
         match = re.search(pattern, details)
         if match:
@@ -205,19 +218,11 @@ def extract_part_numbers(details: str) -> dict:
 
 
 def expand_designators(designator_str: str) -> list[str]:
-    """
-    Expand a designator string into individual designators.
-    e.g., "R1, R2, R3" -> ["R1", "R2", "R3"]
-    e.g., "C1-C5" -> ["C1", "C2", "C3", "C4", "C5"]
-    """
-    import re
-    
+    """Expand a designator string into individual designators."""
     designators = []
-    # Split on comma and clean
     parts = [p.strip() for p in designator_str.split(",") if p.strip()]
     
     for part in parts:
-        # Check for range pattern like "C1-C5" or "R10-R15"
         range_match = re.match(r"([A-Z]+)(\d+)\s*[-–]\s*([A-Z]+)?(\d+)", part, re.IGNORECASE)
         if range_match:
             prefix = range_match.group(1)
@@ -226,7 +231,6 @@ def expand_designators(designator_str: str) -> list[str]:
             for i in range(start, end + 1):
                 designators.append(f"{prefix}{i}")
         else:
-            # Single designator, remove any extra notes in parentheses
             clean = re.sub(r"\s*\([^)]*\)\s*", "", part).strip()
             if clean:
                 designators.append(clean)
@@ -240,37 +244,22 @@ def count_designators(designator_str: str) -> int:
 
 
 def parse_embedded_quantity(component_str: str) -> tuple[str, str]:
-    """
-    Parse quantity from component strings like "TL072 (5)" or "1k (10)".
-    Returns (component_name, quantity).
-    """
-    import re
-    
-    # Match patterns like "TL072 (5)" or "100nF/104 (7)"
+    """Parse quantity from component strings like "TL072 (5)"."""
     match = re.match(r"^(.+?)\s*\((\d+)\)\s*$", component_str.strip())
     if match:
         return match.group(1).strip(), match.group(2)
-    
     return component_str, ""
 
 
 def unpack_side_by_side_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Handle tables with side-by-side columns like:
-    component | quantity | notes | component_1 | quantity_1 | notes_1
-    
-    Unpacks them into a single normalized table.
-    """
-    # Check if we have duplicate column patterns (component_1, quantity_1, etc.)
+    """Handle tables with side-by-side columns."""
     cols = df.columns.tolist()
     
-    # Look for patterns like col, col_1 or component, component_1
+    # Pattern 1: Look for _N suffix patterns
     base_cols = []
     suffix_groups = {}
     
     for col in cols:
-        # Check for _N suffix
-        import re
         match = re.match(r"^(.+?)_(\d+)$", col)
         if match:
             base = match.group(1)
@@ -281,21 +270,17 @@ def unpack_side_by_side_table(df: pd.DataFrame) -> pd.DataFrame:
         else:
             base_cols.append(col)
     
-    # If we found side-by-side columns, unpack them
     if suffix_groups:
         all_rows = []
         
         for _, row in df.iterrows():
-            # First, add the base columns as a row
             base_row = {col: row[col] for col in base_cols}
             if any(str(v).strip() and str(v) != "nan" for v in base_row.values()):
                 all_rows.append(base_row)
             
-            # Then add each suffix group as additional rows
             for suffix in sorted(suffix_groups.keys()):
                 suffix_row = {}
                 for base, full_col in suffix_groups[suffix]:
-                    # Map back to base column name
                     suffix_row[base] = row[full_col]
                 
                 if any(str(v).strip() and str(v) != "nan" for v in suffix_row.values()):
@@ -304,34 +289,233 @@ def unpack_side_by_side_table(df: pd.DataFrame) -> pd.DataFrame:
         if all_rows:
             return pd.DataFrame(all_rows)
     
+    # Pattern 2: Side-by-side placement lists
+    if len(cols) >= 4:
+        designator_pattern = re.compile(r'^[A-Z]+\d+[A-Z]?$', re.I)
+        
+        designator_cols = []
+        for i, col in enumerate(cols):
+            col_vals = df.iloc[:, i].dropna().astype(str).tolist()
+            designator_count = sum(1 for v in col_vals if designator_pattern.match(v.strip()))
+            if designator_count > len(col_vals) * 0.3 and len(col_vals) > 0:
+                designator_cols.append(i)
+        
+        if len(designator_cols) >= 2:
+            all_rows = []
+            
+            segments = []
+            for desig_col in designator_cols:
+                segment_end = min(desig_col + 3, len(cols))
+                next_desig = next((d for d in designator_cols if d > desig_col), len(cols))
+                segment_end = min(segment_end, next_desig)
+                
+                if segment_end - desig_col >= 2:
+                    segments.append((desig_col, segment_end))
+            
+            if segments:
+                for _, row in df.iterrows():
+                    for seg_start, seg_end in segments:
+                        designator = str(row.iloc[seg_start]).strip()
+                        value = str(row.iloc[seg_start + 1]).strip() if seg_start + 1 < len(row) else ""
+                        notes = str(row.iloc[seg_start + 2]).strip() if seg_start + 2 < seg_end else ""
+                        
+                        if not designator_pattern.match(designator):
+                            continue
+                        if not value or value.lower() == "nan":
+                            continue
+                        
+                        row_data = {
+                            "DESIGNATOR": designator,
+                            "VALUE": value,
+                            "NOTES": notes if notes and notes.lower() != "nan" else ""
+                        }
+                        all_rows.append(row_data)
+                
+                if all_rows:
+                    return pd.DataFrame(all_rows)
+    
+    # Pattern 3: Simple paired columns (for TRUE side-by-side tables only)
+    # FIXED: Only apply to 4 or 6 column tables, NOT 3-column tables
+    # 3-column tables like [component, quantity, notes] are standard BOM format,
+    # not side-by-side paired columns. The third column contains important info
+    # like Tayda/Mouser part numbers that must be preserved.
+    if len(cols) in [4, 6] and not suffix_groups:
+        odd_cols_numeric = True
+        even_cols_values = True
+        
+        for i, col in enumerate(cols):
+            col_vals = df.iloc[:, i].astype(str).tolist()
+            numeric_count = sum(1 for v in col_vals if re.match(r'^\d+$', v.strip()))
+            
+            if i % 2 == 1:
+                if numeric_count < len(col_vals) * 0.4:
+                    odd_cols_numeric = False
+            else:
+                value_patterns = [r'\d+[pnuμ]?[FfHh]?', r'\d+[kKMmRrΩ]', r'[A-Z]{2}\d', r'LL', r'BC', r'S\d']
+                value_count = sum(1 for v in col_vals 
+                                if any(re.search(pat, v) for pat in value_patterns))
+                if value_count < len(col_vals) * 0.3:
+                    even_cols_values = False
+        
+        if odd_cols_numeric and even_cols_values:
+            all_rows = []
+            num_pairs = len(cols) // 2
+            
+            for _, row in df.iterrows():
+                for pair_idx in range(num_pairs):
+                    value_col = pair_idx * 2
+                    qty_col = pair_idx * 2 + 1
+                    
+                    value = str(row.iloc[value_col]).strip()
+                    qty = str(row.iloc[qty_col]).strip()
+                    
+                    if value and value.lower() != "nan" and qty and qty.lower() != "nan":
+                        all_rows.append({
+                            "VALUE": value,
+                            "QUANTITY": qty,
+                            "DETAILS": ""
+                        })
+            
+            if all_rows:
+                return pd.DataFrame(all_rows)
+    
     return df
 
 
-def unpack_variant_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Handle variant-style BOMs where columns represent different build options.
-    E.g., columns like: component | torpor | apathy | inertia
+def is_placement_list(df: pd.DataFrame) -> bool:
+    """Detect if a table is a placement list format."""
+    if df.empty or len(df.columns) < 2 or len(df.columns) > 3:
+        return False
     
-    These get unpacked so each variant becomes rows with VALUE/QUANTITY/DETAILS.
-    """
+    designator_col = 0
+    value_col = 1
+    
+    first_col_vals = df.iloc[:, designator_col].astype(str).tolist()
+    designator_pattern = re.compile(r'^[A-Z]+\d+[A-Z]?$', re.I)
+    designator_count = sum(1 for v in first_col_vals 
+                          if designator_pattern.match(v.strip()) or 
+                             v.strip().lower() in ['part number', 'part', 'designator', 'ref'])
+    
+    second_col_vals = df.iloc[:, value_col].astype(str).tolist()
+    value_patterns = [
+        r'^\d+[pnuμ]?[FfHh]?$',
+        r'^\d+[kKMmRrΩ]?\d*$',
+        r'^TL0\d+',
+        r'^LM\d+',
+        r'^BC\d+',
+        r'^BCM\d+',
+        r'^PT\d+',
+        r'^\d+n$',
+        r'^\d+u$',
+        r'^\d+p$',
+        r'^[12][kKMm]T?$',
+        r'^\d+[kK]\d*$',
+        r'^value$',
+        r'^\d+R$',
+        r'^\d+[KKMM]\d*$',
+    ]
+    value_count = sum(1 for v in second_col_vals 
+                      if any(re.match(pat, v.strip(), re.I) for pat in value_patterns))
+    
+    total_rows = len(first_col_vals)
+    return (
+        designator_count > total_rows * 0.5 and
+        value_count > total_rows * 0.4 and
+        len(df.columns) <= 3
+    )
+
+
+def aggregate_placement_list(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert a placement list into an aggregated BOM."""
+    from collections import defaultdict
+    
+    aggregated = defaultdict(lambda: {"qty": 0, "designators": [], "notes": set()})
+    
+    col_names = [str(c).lower() for c in df.columns]
+    
+    designator_col_idx = 0
+    for i, name in enumerate(col_names):
+        if 'designator' in name or 'part' in name or name == 'value':
+            designator_col_idx = i
+            break
+    
+    if col_names[0] == 'value' and len(col_names) >= 2 and 'quantity' in col_names[1]:
+        first_col_vals = df.iloc[:, 0].astype(str).tolist()[:5]
+        designator_pattern = re.compile(r'^[A-Z]+\d+[A-Z]?$', re.I)
+        if any(designator_pattern.match(v.strip()) for v in first_col_vals):
+            designator_col_idx = 0
+            value_col_idx = 1
+        else:
+            designator_col_idx = 0
+            value_col_idx = 1
+    else:
+        value_col_idx = 1 if len(df.columns) > 1 else 0
+    
+    notes_col_idx = 2 if len(df.columns) > 2 else None
+    
+    for _, row in df.iterrows():
+        designator = str(row.iloc[designator_col_idx]).strip()
+        value = str(row.iloc[value_col_idx]).strip() if value_col_idx < len(row) else ""
+        notes = str(row.iloc[notes_col_idx]).strip() if notes_col_idx is not None and notes_col_idx < len(row) and pd.notna(row.iloc[notes_col_idx]) else ""
+        
+        if not value or value.lower() == "nan":
+            continue
+            
+        if value.lower() in ["value", "component", "part", "comments", "quantity", "notes"]:
+            continue
+        
+        if not re.match(r'^[A-Z]+\d+', designator, re.I):
+            if re.match(r'^[A-Z]+\d+', value, re.I):
+                designator, value = value, designator
+            else:
+                continue
+        
+        aggregated[value]["qty"] += 1
+        aggregated[value]["designators"].append(designator)
+        if notes and notes.lower() != "nan":
+            aggregated[value]["notes"].add(notes)
+    
+    rows = []
+    for value, data in aggregated.items():
+        def designator_sort_key(d):
+            match = re.match(r'^([A-Z]+)(\d+)([A-Z]?)$', d, re.I)
+            if match:
+                return (match.group(1).upper(), int(match.group(2)), match.group(3))
+            return (d, 0, '')
+        
+        sorted_designators = sorted(data["designators"], key=designator_sort_key)
+        designator_str = ", ".join(sorted_designators)
+        notes_str = "; ".join(data["notes"]) if data["notes"] else ""
+        details = f"Designators: {designator_str}"
+        if notes_str:
+            details += f" | {notes_str}"
+        
+        rows.append({
+            "VALUE": value,
+            "QUANTITY": str(data["qty"]),
+            "DETAILS": details
+        })
+    
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def unpack_variant_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Handle variant-style BOMs (torpor/apathy/inertia style)."""
     cols = df.columns.tolist()
     
-    # Detect variant tables - first column is designator (C1, R1, etc.), 
-    # other columns are variant names with component values
+    if is_placement_list(df):
+        return aggregate_placement_list(df)
+    
     first_col = cols[0].lower() if cols else ""
     
-    # Check if first column looks like a designator column
     if len(df) > 0:
         first_col_vals = df.iloc[:, 0].astype(str).tolist()
-        import re
         designator_pattern = re.compile(r'^[A-Z]+\d+$', re.I)
         designator_count = sum(1 for v in first_col_vals if designator_pattern.match(v.strip()))
         
-        # If most values in first column look like designators (C1, R1, U1, etc.)
-        if designator_count > len(first_col_vals) * 0.5 and len(cols) > 2:
-            # This is likely a variant table - unpack it
+        if designator_count > len(first_col_vals) * 0.5 and len(cols) > 3:
             all_rows = []
-            variant_cols = cols[1:]  # All columns except the designator column
+            variant_cols = cols[1:]
             
             for _, row in df.iterrows():
                 designator = str(row.iloc[0])
@@ -352,27 +536,23 @@ def unpack_variant_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_bom_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize various BOM formats to a standard structure.
-    Handles:
-    - Embedded quantities like "TL072 (5)"
-    - Side-by-side column layouts
-    - Variant tables (torpor/apathy/inertia style)
-    - Various column naming conventions
-    """
-    # First, unpack side-by-side tables
+    """Normalize various BOM formats to standard structure."""
     df = unpack_side_by_side_table(df)
     
-    # Check for and unpack variant tables
+    if is_placement_list(df):
+        return aggregate_placement_list(df)
+    
     df = unpack_variant_table(df)
     
-    # Check for "COMPONENT (QUANTITY)" style columns
+    # Handle embedded quantities FIRST (before 2-column handler)
+    # This handles tables like MBD where column is "COMPONENT (QUANTITY)" with values like "TL072 (5)"
     cols_lower = {c: c.lower() for c in df.columns}
+    embedded_qty_found = False
     
-    for col in df.columns:
-        col_lower = cols_lower[col]
+    for col in list(df.columns):  # Use list() to avoid modification during iteration
+        col_lower = cols_lower.get(col, col.lower())
         if "component" in col_lower and "quantity" in col_lower:
-            # This column has embedded quantities - parse them out
+            embedded_qty_found = True
             components = []
             quantities = []
             
@@ -381,47 +561,52 @@ def normalize_bom_table(df: pd.DataFrame) -> pd.DataFrame:
                 components.append(comp)
                 quantities.append(qty)
             
-            # Replace the column with just component, add quantity column
             df[col] = components
-            df.rename(columns={col: "VALUE"}, inplace=True)
+            df = df.rename(columns={col: "VALUE"})
             
-            # Insert quantity column if it doesn't exist
             if "QUANTITY" not in df.columns and "quantity" not in [c.lower() for c in df.columns]:
-                # Find the position after the component column
                 col_idx = df.columns.get_loc("VALUE")
                 df.insert(col_idx + 1, "QUANTITY", quantities)
+            break  # Only process one embedded quantity column
     
-    # Normalize column names to standard: VALUE, QUANTITY, DETAILS
+    # Handle simple 2-column tables (only if no embedded qty was found)
+    if not embedded_qty_found and len(df.columns) == 2:
+        col1_vals = df.iloc[:, 0].astype(str).tolist()
+        col2_vals = df.iloc[:, 1].astype(str).tolist()
+        
+        qty_count = sum(1 for v in col2_vals if re.match(r'^\d+$', v.strip()))
+        value_patterns = [r'\d+[pnuμ]?[FfHh]?', r'\d+[kKMmRrΩ]', r'[A-Z]{2}\d', r'LL\d', r'BC\d', r'S\dJL']
+        value_count = sum(1 for v in col1_vals 
+                        if any(re.search(pat, v) for pat in value_patterns))
+        
+        if qty_count > len(col2_vals) * 0.5 and value_count > len(col1_vals) * 0.3:
+            df.columns = ["VALUE", "QUANTITY"]
+            df["DETAILS"] = ""
+            return df
+    
+    # Normalize column names
     column_mapping = {}
     for col in df.columns:
         col_lower = col.lower().strip()
         
-        # Map to VALUE
         if col_lower in ["value", "component", "part", "item"]:
             column_mapping[col] = "VALUE"
-        # Map to QUANTITY  
         elif col_lower in ["quantity", "qty", "count", "amount"]:
             column_mapping[col] = "QUANTITY"
-        # Map to DETAILS
         elif col_lower in ["details", "notes", "description", "info", "comments"]:
             column_mapping[col] = "DETAILS"
     
-    # Apply the mapping
     if column_mapping:
         df = df.rename(columns=column_mapping)
     
-    # Ensure we have the standard columns (add empty ones if missing)
     for std_col in ["VALUE", "QUANTITY", "DETAILS"]:
         if std_col not in df.columns:
             df[std_col] = ""
     
-    # Reorder to put standard columns first
     std_cols = ["VALUE", "QUANTITY", "DETAILS"]
     other_cols = [c for c in df.columns if c not in std_cols]
     df = df[std_cols + other_cols]
     
-    # If VALUE column is empty but we have other columns with data, 
-    # try to use the first non-standard column as VALUE
     if df["VALUE"].astype(str).str.strip().eq("").all() or df["VALUE"].isna().all():
         for col in other_cols:
             if not df[col].astype(str).str.strip().eq("").all():
@@ -429,54 +614,174 @@ def normalize_bom_table(df: pd.DataFrame) -> pd.DataFrame:
                 df = df.drop(columns=[col])
                 break
     
-    # Clean up: remove rows where VALUE is empty/nan
     df = df[df["VALUE"].astype(str).str.strip().ne("")]
     df = df[df["VALUE"].astype(str).ne("nan")]
     
     return df
 
 
-def process_single_pdf(pdf_path: Path) -> dict:
+def process_single_pdf(pdf_path: Path, resolver: ModuleNameResolver, strategy: str = "filename") -> dict:
     """
     Process a single BOM PDF and return extracted data.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        resolver: ModuleNameResolver instance
+        strategy: "filename" (recommended) or "content"
     
     Returns:
         Dictionary with module name, tables, and metadata
     """
-    module_name = pdf_path.stem
+    filename = pdf_path.stem
     
-    # Handle common NLC naming patterns
-    # e.g., "NLC - 4seq BOM.pdf" -> "4seq"
-    clean_name = module_name
-    for prefix in ["NLC - ", "NLC-", "NLC ", "nlc - ", "nlc-", "nlc "]:
-        if clean_name.lower().startswith(prefix.lower()):
-            clean_name = clean_name[len(prefix):]
-    for suffix in [" BOM", " bom", "_BOM", "_bom", "-BOM", "-bom"]:
-        if clean_name.endswith(suffix):
-            clean_name = clean_name[:-len(suffix)]
+    # Get module name using the resolver
+    clean_name, detection_method = resolver.resolve(pdf_path, strategy=strategy)
     
-    print(f"Processing: {module_name}")
+    print(f"Processing: {pdf_path.name}")
+    if clean_name != filename:
+        method_indicator = {
+            "filename_override": "✓",
+            "filename_db_match": "◆",
+            "filename_cleaned": "○",
+            "content_exact_match": "📄",
+            "content_alias_match": "📄",
+            "content_title_extraction": "📄",
+            "content_frequency_analysis": "📄",
+            "filename_fallback": "📁",
+        }.get(detection_method, "?")
+        print(f"  → Module: {clean_name} [{method_indicator} {detection_method}]")
     
     tables = extract_tables_from_pdf(pdf_path)
     cleaned_tables = []
+    placement_list_tables = []
     total_rows = 0
+    total_raw_rows = 0
+    filtered_rows = 0
     
-    for i, df in enumerate(tables):
-        cleaned = clean_bom_dataframe(df)
-        if not cleaned.empty:
-            # Normalize the table format
-            cleaned = normalize_bom_table(cleaned)
-            cleaned_tables.append(cleaned)
-            total_rows += len(cleaned)
+    candidate_tables = 0
+    noise_tables = 0
+    tables_not_bom = 0
     
-    print(f"  Found {len(cleaned_tables)} table(s), {total_rows} total rows")
+    if not tables:
+        print(f"  ⚠ NO TABLES FOUND - Tabula could not detect any table structures")
+    else:
+        for i, df in enumerate(tables):
+            if df.empty:
+                noise_tables += 1
+                continue
+                
+            raw_rows = len(df)
+            raw_cols = len(df.columns)
+            
+            if raw_cols < 2 or raw_rows < 2:
+                noise_tables += 1
+                continue
+            
+            candidate_tables += 1
+            total_raw_rows += raw_rows
+            
+            cleaned = clean_bom_dataframe(df)
+            if not cleaned.empty:
+                if is_placement_list(cleaned):
+                    aggregated = aggregate_placement_list(cleaned)
+                    if not aggregated.empty:
+                        placement_list_tables.append(aggregated)
+                        filtered_rows += raw_rows - len(aggregated)
+                else:
+                    cleaned = normalize_bom_table(cleaned)
+                    if not cleaned.empty:
+                        cleaned_tables.append(cleaned)
+                        cleaned_rows = len(cleaned)
+                        total_rows += cleaned_rows
+                        
+                        rows_lost = raw_rows - cleaned_rows
+                        if rows_lost > 0:
+                            filtered_rows += rows_lost
+                    else:
+                        tables_not_bom += 1
+            else:
+                tables_not_bom += 1
+    
+    # Merge placement list tables
+    if placement_list_tables:
+        from collections import defaultdict
+        
+        merged_aggregation = defaultdict(lambda: {"qty": 0, "designators": [], "notes": set()})
+        
+        for pl_df in placement_list_tables:
+            for _, row in pl_df.iterrows():
+                value = row.get("VALUE", "")
+                qty = int(row.get("QUANTITY", 0)) if row.get("QUANTITY", "").isdigit() else 0
+                details = row.get("DETAILS", "")
+                
+                designator_match = re.search(r"Designators?: ([^|]+)", details)
+                if designator_match:
+                    designators = [d.strip() for d in designator_match.group(1).split(",")]
+                else:
+                    designators = []
+                
+                notes_match = re.search(r"\| (.+)$", details)
+                notes = notes_match.group(1) if notes_match else ""
+                
+                merged_aggregation[value]["qty"] += qty
+                merged_aggregation[value]["designators"].extend(designators)
+                if notes:
+                    merged_aggregation[value]["notes"].add(notes)
+        
+        merged_rows = []
+        for value, data in merged_aggregation.items():
+            def designator_sort_key(d):
+                match = re.match(r'^([A-Z]+)(\d+)([A-Z]?)$', d, re.I)
+                if match:
+                    return (match.group(1).upper(), int(match.group(2)), match.group(3))
+                return (d, 0, '')
+            
+            sorted_designators = sorted(set(data["designators"]), key=designator_sort_key)
+            designator_str = ", ".join(sorted_designators)
+            notes_str = "; ".join(data["notes"]) if data["notes"] else ""
+            details = f"Designators: {designator_str}"
+            if notes_str:
+                details += f" | {notes_str}"
+            
+            merged_rows.append({
+                "VALUE": value,
+                "QUANTITY": str(data["qty"]),
+                "DETAILS": details
+            })
+        
+        if merged_rows:
+            merged_df = pd.DataFrame(merged_rows)
+            cleaned_tables.insert(0, merged_df)
+            total_rows += len(merged_rows)
+    
+    # Summary output
+    if cleaned_tables:
+        print(f"  Found {len(cleaned_tables)} BOM table(s), {total_rows} total component rows")
+        if placement_list_tables:
+            print(f"  ℹ Merged {len(placement_list_tables)} placement list segment(s)")
+        if filtered_rows > 0:
+            print(f"  ℹ {filtered_rows} row(s) filtered during cleaning")
+        if tables_not_bom > 0:
+            print(f"  ℹ {tables_not_bom} candidate table(s) not recognized as BOM")
+    else:
+        if candidate_tables > 0:
+            print(f"  ⚠ TABLE(S) NOT CONSUMED - {candidate_tables} candidate(s) found but none recognized as BOM")
+        elif tables:
+            print(f"  ⚠ NO BOM TABLES FOUND - {len(tables)} small fragment(s) detected")
     
     return {
         "filename": pdf_path.name,
         "module_name": clean_name,
+        "name_detection_method": detection_method,
         "tables": cleaned_tables,
         "table_count": len(cleaned_tables),
-        "total_rows": total_rows
+        "total_rows": total_rows,
+        "raw_tables_found": len(tables) if tables else 0,
+        "candidate_tables": candidate_tables,
+        "raw_rows_found": total_raw_rows,
+        "rows_filtered": filtered_rows,
+        "tables_not_bom": tables_not_bom,
+        "placement_lists_merged": len(placement_list_tables) if placement_list_tables else 0
     }
 
 
@@ -484,10 +789,7 @@ def scan_directory(directory: Path, recursive: bool = False) -> list[Path]:
     """Find all PDF files in a directory."""
     pattern = "**/*.pdf" if recursive else "*.pdf"
     pdfs = list(directory.glob(pattern))
-    
-    # Also check for .PDF extension
     pdfs.extend(directory.glob(pattern.replace(".pdf", ".PDF")))
-    
     return sorted(set(pdfs))
 
 
@@ -496,18 +798,15 @@ def export_to_csv(results: list[dict], output_dir: Path, combine: bool = False):
     output_dir.mkdir(parents=True, exist_ok=True)
     
     if combine:
-        # Combine all tables into one CSV with standardized columns
         all_dfs = []
         for result in results:
             for df in result["tables"]:
                 df = df.copy()
                 
-                # Ensure standard columns exist
                 for col in ["VALUE", "QUANTITY", "DETAILS"]:
                     if col not in df.columns:
                         df[col] = ""
                 
-                # Keep only standard columns plus module info
                 df = df[["VALUE", "QUANTITY", "DETAILS"]].copy()
                 df.insert(0, "_module", result["module_name"])
                 df.insert(1, "_source_file", result["filename"])
@@ -519,10 +818,8 @@ def export_to_csv(results: list[dict], output_dir: Path, combine: bool = False):
             combined.to_csv(output_path, index=False)
             print(f"Saved combined CSV: {output_path}")
     else:
-        # One CSV per module
         for result in results:
             if result["tables"]:
-                # Combine tables from same PDF
                 combined = pd.concat(result["tables"], ignore_index=True)
                 safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in result["module_name"])
                 output_path = output_dir / f"{safe_name}.csv"
@@ -535,7 +832,6 @@ def export_to_json(results: list[dict], output_dir: Path, combine: bool = False)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     def df_to_records(tables):
-        """Convert list of DataFrames to list of record lists."""
         return [df.fillna("").to_dict(orient="records") for df in tables]
     
     if combine:
@@ -548,6 +844,7 @@ def export_to_json(results: list[dict], output_dir: Path, combine: bool = False)
         for result in results:
             output_data["modules"].append({
                 "module_name": result["module_name"],
+                "name_detection_method": result.get("name_detection_method", "unknown"),
                 "filename": result["filename"],
                 "table_count": result["table_count"],
                 "total_rows": result["total_rows"],
@@ -563,6 +860,7 @@ def export_to_json(results: list[dict], output_dir: Path, combine: bool = False)
             if result["tables"]:
                 output_data = {
                     "module_name": result["module_name"],
+                    "name_detection_method": result.get("name_detection_method", "unknown"),
                     "filename": result["filename"],
                     "extracted_at": datetime.now().isoformat(),
                     "tables": df_to_records(result["tables"])
@@ -581,22 +879,19 @@ def export_to_excel(results: list[dict], output_dir: Path, combine: bool = False
     if combine:
         output_path = output_dir / "all_boms.xlsx"
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            # Summary sheet
             summary_data = [{
                 "Module": r["module_name"],
+                "Detection Method": r.get("name_detection_method", "unknown"),
                 "Source File": r["filename"],
                 "Tables": r["table_count"],
                 "Total Rows": r["total_rows"]
             } for r in results]
             pd.DataFrame(summary_data).to_excel(writer, sheet_name="Summary", index=False)
             
-            # One sheet per module
             for result in results:
                 if result["tables"]:
                     combined = pd.concat(result["tables"], ignore_index=True)
-                    # Excel sheet names limited to 31 chars
                     sheet_name = result["module_name"][:31]
-                    # Remove invalid characters
                     sheet_name = "".join(c if c not in "[]:*?/\\" else "_" for c in sheet_name)
                     combined.to_excel(writer, sheet_name=sheet_name, index=False)
         
@@ -612,10 +907,7 @@ def export_to_excel(results: list[dict], output_dir: Path, combine: bool = False
 
 
 def export_to_mouser(results: list[dict], output_dir: Path, combine: bool = False):
-    """
-    Export results in Mouser-compatible BOM format.
-    Extracts Mouser part numbers and generates a format suitable for upload.
-    """
+    """Export results in Mouser-compatible BOM format."""
     output_dir.mkdir(parents=True, exist_ok=True)
     
     all_parts = []
@@ -623,7 +915,6 @@ def export_to_mouser(results: list[dict], output_dir: Path, combine: bool = Fals
     for result in results:
         for df in result["tables"]:
             for _, row in df.iterrows():
-                # Find the value/part column
                 value = ""
                 quantity = ""
                 details = ""
@@ -636,10 +927,9 @@ def export_to_mouser(results: list[dict], output_dir: Path, combine: bool = Fals
                     if col_lower in ["value", "component", "part"]:
                         value = cell_value
                     elif "value" in col_lower or "component" in col_lower or "part" in col_lower:
-                        if not value:  # Don't override if already set
+                        if not value:
                             value = cell_value
                     elif "designator" in col_lower:
-                        # "DESIGNATOR/QUANTITY" column - this is designators, not quantities
                         designators = cell_value
                     elif col_lower in ["qty", "quantity"]:
                         quantity = cell_value
@@ -654,11 +944,9 @@ def export_to_mouser(results: list[dict], output_dir: Path, combine: bool = Fals
                         if not details:
                             details = cell_value
                 
-                # If quantity column doesn't exist or is empty, count designators
                 if (not quantity or quantity in ["", "nan"]) and designators:
                     quantity = str(count_designators(designators))
                 
-                # Extract part numbers
                 part_nums = extract_part_numbers(details)
                 
                 part_entry = {
@@ -673,8 +961,6 @@ def export_to_mouser(results: list[dict], output_dir: Path, combine: bool = Fals
                     "Details": details
                 }
                 
-                # Try to extract footprint from details
-                import re
                 footprint_match = re.search(r"\b(0805|0603|0402|1206|SOT-23|SOIC|SOD-\d+|sod-\d+)\b", details, re.I)
                 if footprint_match:
                     part_entry["Footprint/Package"] = footprint_match.group(1).upper()
@@ -703,10 +989,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    %(prog)s ./boms                          # Extract to CSV (default)
-    %(prog)s ./boms -o json                  # Extract to JSON
-    %(prog)s ./boms -o excel --combine       # Combine all into one Excel file
-    %(prog)s ./boms -r                       # Recursive directory scan
+    %(prog)s ./boms                             # Extract using filename-priority (default)
+    %(prog)s ./boms --content-priority          # Extract using content-based detection
+    %(prog)s ./boms -o json --combine           # Combine all into one JSON file
+    %(prog)s ./boms -r                          # Recursive directory scan
         """
     )
     
@@ -727,7 +1013,7 @@ Examples:
         "-d", "--output-dir",
         type=Path,
         default=None,
-        help="Output directory (default: ./extracted_boms)"
+        help="Output directory (default: ./output)"
     )
     
     parser.add_argument(
@@ -743,15 +1029,37 @@ Examples:
     )
     
     parser.add_argument(
-        "-e", "--expand",
+        "--mouser",
         action="store_true",
-        help="Expand designator lists into individual component rows"
+        help="Generate Mouser-compatible BOM format"
+    )
+    
+    # Module name resolution options
+    name_group = parser.add_mutually_exclusive_group()
+    name_group.add_argument(
+        "--filename-priority",
+        action="store_true",
+        default=True,
+        help="Use filename for module names with overrides (default, recommended)"
+    )
+    name_group.add_argument(
+        "--content-priority",
+        action="store_true",
+        help="Use PDF content for module names (may misidentify some modules)"
     )
     
     parser.add_argument(
-        "--mouser",
-        action="store_true",
-        help="Generate Mouser-compatible BOM format (CSV with part numbers)"
+        "--modules-db",
+        type=Path,
+        default=None,
+        help="Path to nlc_modules.json canonical names database"
+    )
+    
+    parser.add_argument(
+        "--overrides",
+        type=Path,
+        default=None,
+        help="Path to module_overrides.json for filename→name mappings"
     )
     
     args = parser.parse_args()
@@ -766,10 +1074,26 @@ Examples:
         sys.exit(1)
     
     # Set output directory
-    output_dir = args.output_dir or Path("./extracted_boms")
+    output_dir = args.output_dir or Path("./output")
+    
+    # Determine naming strategy
+    strategy = "content" if args.content_priority else "filename"
+    
+    # Initialize the resolver
+    resolver = ModuleNameResolver(
+        modules_db_path=args.modules_db,
+        overrides_path=args.overrides
+    )
+    
+    # Report configuration
+    if resolver.db.get("canonical_names"):
+        print(f"Loaded {len(resolver.db['canonical_names'])} canonical module names")
+    if resolver.overrides:
+        print(f"Loaded {len(resolver.overrides)} filename overrides")
+    print(f"Module naming strategy: {strategy}")
     
     # Find PDFs
-    print(f"Scanning: {args.directory}")
+    print(f"\nScanning: {args.directory}")
     pdfs = scan_directory(args.directory, args.recursive)
     
     if not pdfs:
@@ -777,12 +1101,24 @@ Examples:
         sys.exit(0)
     
     print(f"Found {len(pdfs)} PDF file(s)\n")
+
+    seen_hashes = set()
+    duplicates = []
     
     # Process each PDF
     results = []
     for pdf_path in pdfs:
-        result = process_single_pdf(pdf_path)
+        h = file_sha256(pdf_path)
+        if h in seen_hashes:
+            duplicates.append(pdf_path)
+            print(f"Skipping duplicate (same bytes): {pdf_path.name}")
+            continue
+        seen_hashes.add(h)
+        result = process_single_pdf(pdf_path, resolver, strategy=strategy)
         results.append(result)
+    
+    if duplicates:
+        print(f"\nSkipped {len(duplicates)} duplicate PDF(s) by content hash.")
     
     # Export results
     print(f"\nExporting to {args.output.upper()}...")
@@ -799,7 +1135,38 @@ Examples:
     # Summary
     total_tables = sum(r["table_count"] for r in results)
     total_rows = sum(r["total_rows"] for r in results)
-    print(f"\nDone! Processed {len(results)} files, extracted {total_tables} tables, {total_rows} total rows")
+    
+    files_no_tables = sum(1 for r in results if r["raw_tables_found"] == 0)
+    files_not_consumed = sum(1 for r in results if r["candidate_tables"] > 0 and r["table_count"] == 0)
+    total_filtered = sum(r.get("rows_filtered", 0) for r in results)
+    total_not_bom = sum(r.get("tables_not_bom", 0) for r in results)
+    
+    method_counts = Counter(r.get("name_detection_method", "unknown") for r in results)
+    
+    print(f"\nDone! Processed {len(results)} files, extracted {total_tables} BOM tables, {total_rows} total rows")
+    
+    print(f"\nModule name detection breakdown:")
+    for method, count in method_counts.most_common():
+        indicator = {
+            "filename_override": "✓",
+            "filename_db_match": "◆",
+            "filename_cleaned": "○",
+            "content_exact_match": "📄",
+            "content_alias_match": "📄",
+            "content_title_extraction": "📄",
+            "content_frequency_analysis": "📄",
+            "filename_fallback": "📁",
+        }.get(method, "?")
+        print(f"  {indicator} {method}: {count}")
+    
+    if files_no_tables > 0:
+        print(f"\n  ⚠ {files_no_tables} file(s) had NO TABLES detected by Tabula")
+    if files_not_consumed > 0:
+        print(f"  ⚠ {files_not_consumed} file(s) had candidate tables NOT CONSUMED")
+    if total_filtered > 0:
+        print(f"  ℹ {total_filtered} total row(s) filtered during cleaning")
+    if total_not_bom > 0:
+        print(f"  ℹ {total_not_bom} candidate table(s) not recognized as BOM")
 
 
 if __name__ == "__main__":
