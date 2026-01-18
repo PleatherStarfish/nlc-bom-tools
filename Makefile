@@ -1,19 +1,26 @@
-.PHONY: help install test example clean
+.PHONY: help install extract process all example clean
 
 help:
 	@echo "NLC BOM Tools"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make install    Install dependencies"
+	@echo "  make extract    Extract BOMs from PDFs in boms/ folder"
+	@echo "  make process    Process extracted data into shopping list"
+	@echo "  make all        Run extract + process"
 	@echo "  make example    Run example with sample data"
 	@echo "  make clean      Remove output files"
-	@echo ""
-	@echo "Manual usage:"
-	@echo "  python3 nlc_bom_extractor.py <pdf_dir> -o csv --combine"
-	@echo "  python3 nlc_bom_processor.py all_boms_combined.csv --shopping shopping.xlsx"
 
 install:
 	pip install -r requirements.txt
+
+extract:
+	python3 nlc_bom_extractor.py boms/ -o csv --combine -d output
+
+process:
+	python3 nlc_bom_processor.py output/all_boms_combined.csv --shopping output/shopping.xlsx --stats
+
+all: extract process
 
 example:
 	@echo "Processing example input..."
